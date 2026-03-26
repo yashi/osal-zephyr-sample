@@ -1,0 +1,17 @@
+manifest:
+
+  projects:
+    - name: zephyr
+      url: https://github.com/zephyrproject-rtos/zephyr
+      revision: main
+      path: zephyr
+      west-commands: scripts/west-commands.yml
+      import:
+        name-allowlist:
+          - cmsis
+          - cmsis_6
+
+    - name: osal
+      url: /home/yashi/src/osal
+      revision: add-zephyr-support
+      path: modules/lib/osal
