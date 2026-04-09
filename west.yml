@@ -12,6 +12,6 @@ manifest:
           - cmsis_6
 
     - name: osal
-      url: /home/yashi/src/osal
+      url: https://github.com/yashi/osal-zephyr
       revision: add-zephyr-support
       path: modules/lib/osal
