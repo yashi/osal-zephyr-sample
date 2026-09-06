@@ -57,23 +57,49 @@ is omitted; record which source was actually selected.
 ## Run and inspect results
 
 Each application emits a start record, individual check results, and one
-aggregate result. Require a nonempty set of passing checks and a complete
-matching result; a boot banner alone is insufficient.
+aggregate result. A nonempty set of passing checks and a complete matching
+result are required. The runner also rejects inconsistent counts, duplicate
+checks, incomplete output, and a nonzero host process status.
 
-Run a native build directly and require process status zero:
+Native simulation exits with the application result:
 
 ```sh
-build/basic-native/zephyr/zephyr.exe
+python3 osal-zephyr-sample/scripts/run.py --app basic \
+  --log build/basic-native/run.log -- \
+  build/basic-native/zephyr/zephyr.exe
 ```
 
-Run a QEMU build with `west build -d build/basic-qemu -t run`. After the
-complete application result, quit QEMU with Ctrl-A x. That controlled
-emulator exit is separate from the application outcome printed in its
-result records.
+For a QEMU build, the runner waits for the application result and then sends
+QEMU's quit sequence. Its controlled emulator exit is separate from the
+application outcome verified in the output:
 
-For Nucleo, start `tio /dev/ttyACM0` before flashing with
-`west flash -d build/basic-nucleo -r openocd` in another terminal. Require
-a successful flash and the complete application result from the fresh boot.
+```sh
+python3 osal-zephyr-sample/scripts/run.py --app basic --qemu \
+  --log build/basic-qemu/run.log -- \
+  west build -d build/basic-qemu -t run
+```
+
+Use `--app binsem` and its matching build directory for the other stage.
+A timeout is a failure; increase `--timeout` explicitly when investigating
+slow runs.
+
+For Nucleo, start serial capture before flashing:
+
+```sh
+tio /dev/ttyACM0 -L --log-file build/basic-nucleo/run.log
+```
+
+In another terminal, run `west flash -d build/basic-nucleo -r openocd`.
+After the fresh boot and complete result, exit tio and validate the capture:
+
+```sh
+python3 osal-zephyr-sample/scripts/run.py --app basic \
+  --log-file build/basic-nucleo/run.log
+```
+
+Require a successful flash as well as a passing capture from that run.
+A hardware board has no process exit status to substitute for its result.
+Use a fresh log for each run; the validator rejects multiple result sets.
 
 ## Record the stage inputs
 
