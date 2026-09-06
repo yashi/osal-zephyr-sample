@@ -11,6 +11,7 @@ that application's stated scope.
 |---|---|
 | `apps/basic` | Link the real OSAL and BSP libraries, check the version accessors against their headers, and check the BSP's initial argument state |
 | `apps/binsem` | Call the Zephyr binary semaphore creation provider and inspect the created native semaphore objects |
+| `apps/clock` | Exercise native monotonic and settable local clocks, including forward and backward local-time changes |
 | `apps/init` | Call real OSAL initialization, check tick values and console identity/draining, repeat initialization, and request shutdown before entering idle |
 
 `basic` does not call `OS_API_Init()` or `OS_Application_Startup()`. It makes
