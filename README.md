@@ -11,11 +11,11 @@ that application's stated scope.
 |---|---|
 | `apps/basic` | Link the real OSAL and BSP libraries, check the version accessors against their headers, and check the BSP's initial argument state |
 | `apps/binsem` | Call the Zephyr binary semaphore creation provider and inspect the created native semaphore objects |
+| `apps/init` | Call real OSAL initialization, check tick values and console identity/draining, repeat initialization, and request shutdown before entering idle |
 
-`basic` does not call `OS_API_Init()` or `OS_Application_Startup()`. The
-current port cannot complete that initialization. This application makes
+`basic` does not call `OS_API_Init()` or `OS_Application_Startup()`. It makes
 initial build integration independently checkable without depending on
-unfinished task, console, or synchronization providers.
+the later initialization or object providers.
 
 `binsem` uses OSAL private headers and calls `OS_BinSemCreate_Impl()` with
 explicit table-slot tokens. It checks creation using Zephyr's native
@@ -23,6 +23,11 @@ semaphore accessors. It does not exercise OSAL public semaphore allocation,
 ID management, give/take, timeout, flush, or deletion. Keep this scope clear
 when extending it to later stages. The production provider is linked from
 the selected OSAL module; its source is not copied into the harness.
+
+`init` requires the initialization and synchronous console providers. Its
+ten checks cover initialization and shutdown signaling, not public task or
+semaphore lifecycle, clocks, timers, or object teardown. Focused provider and
+concurrency tests live in the OSAL checkout at `src/tests/zephyr-init`.
 
 ## Build a stage
 
@@ -79,7 +84,8 @@ python3 osal-zephyr-sample/scripts/run.py --app basic --qemu \
   west build -d build/basic-qemu -t run
 ```
 
-Use `--app binsem` and its matching build directory for the other stage.
+Use the selected application directory name as the `--app` value and use its
+matching build directory.
 A timeout is a failure; increase `--timeout` explicitly when investigating
 slow runs.
 
