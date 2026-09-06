@@ -10,11 +10,19 @@ that application's stated scope.
 | Path | Scope |
 |---|---|
 | `apps/basic` | Link the real OSAL and BSP libraries, check the version accessors against their headers, and check the BSP's initial argument state |
+| `apps/binsem` | Call the Zephyr binary semaphore creation provider and inspect the created native semaphore objects |
 
 `basic` does not call `OS_API_Init()` or `OS_Application_Startup()`. The
 current port cannot complete that initialization. This application makes
 initial build integration independently checkable without depending on
 unfinished task, console, or synchronization providers.
+
+`binsem` uses OSAL private headers and calls `OS_BinSemCreate_Impl()` with
+explicit table-slot tokens. It checks creation using Zephyr's native
+semaphore accessors. It does not exercise OSAL public semaphore allocation,
+ID management, give/take, timeout, flush, or deletion. Keep this scope clear
+when extending it to later stages. The production provider is linked from
+the selected OSAL module; its source is not copied into the harness.
 
 ## Build a stage
 
@@ -33,8 +41,9 @@ west build -p always -d build/basic-native -b native_sim \
   -DEXTRA_ZEPHYR_MODULES="$PWD/osal-zephyr"
 ```
 
-Use separate pristine build directories for each application,
-revision, and target. The three development targets are:
+Select `apps/binsem` for creation checks. Use separate pristine build
+directories for each application, revision, and target. The three
+development targets are:
 
 - `native_sim`
 - `qemu_cortex_m3`
