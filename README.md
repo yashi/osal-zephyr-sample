@@ -12,6 +12,7 @@ that application's stated scope.
 | `apps/basic` | Link the real OSAL and BSP libraries, check the version accessors against their headers, and check the BSP's initial argument state |
 | `apps/binsem` | Exercise binary-semaphore create, give, take, timed-wait, flush, information, delete, and slot-reuse provider behavior |
 | `apps/clock` | Exercise native monotonic and settable local clocks, including forward and backward local-time changes |
+| `apps/condvar` | Exercise condition-variable locking, waiting, signaling, and broadcasting with three Zephyr threads |
 | `apps/init` | Call real OSAL initialization, check tick values and console identity/draining, repeat initialization, and request shutdown before entering idle |
 | `apps/mutex` | Exercise recursive mutex take/give behavior, independent objects, information, delete, and slot reuse |
 
