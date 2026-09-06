@@ -109,6 +109,60 @@ Require a successful flash as well as a passing capture from that run.
 A hardware board has no process exit status to substitute for its result.
 Use a fresh log for each run; the validator rejects multiple result sets.
 
+## Zephyr-only test suites (`tests/`)
+
+`tests/` holds Zephyr-only ztest/Twister suites, as opposed to the hand-rolled
+stage applications above. Twister discovers every suite under the directory
+automatically, so adding a new suite (a `tests.yaml`/`testcase.yaml`,
+`CMakeLists.txt`, and `prj.conf` alongside its sources, following the
+`tests/zephyr-init` layout) needs no changes anywhere else to be picked up.
+
+Each suite's `tests.yaml` lists the three development targets under both
+`platform_allow` and `integration_platforms`, so the board list lives in the
+test file, not on the command line.
+
+Run every suite on `native_sim` and `qemu_cortex_m3` (both build and execute
+their checks through the `ztest` harness) with:
+
+```sh
+west twister -T osal-zephyr-sample/tests -G \
+  -x=EXTRA_ZEPHYR_MODULES="$PWD/osal-zephyr"
+```
+
+`-G`/`--integration` runs each suite's `integration_platforms` list instead of
+Twister's own per-arch default platform, which is otherwise just
+`native_sim/native`. This same invocation also builds (but, with no hardware
+attached, does not run) the `nucleo_h755zi_q/stm32h755xx/m7` configuration, so
+a build regression on that target is still caught.
+
+### Run on Nucleo hardware
+
+Twister can flash and validate the real board itself, replacing the manual
+`tio`/`west flash` capture used for the stage applications. First generate a
+hardware map once per machine:
+
+```sh
+west twister --generate-hardware-map hwmap.yaml
+```
+
+Edit the generated entry's `platform:` field from `unknown` to
+`nucleo_h755zi_q/stm32h755xx/m7`; `runner: openocd` and the `/dev/ttyACM0`
+serial device are detected correctly. Then run:
+
+```sh
+west twister -T osal-zephyr-sample/tests -G \
+  -x=EXTRA_ZEPHYR_MODULES="$PWD/osal-zephyr" \
+  --device-testing --hardware-map hwmap.yaml
+```
+
+`--device-testing` restricts the run to platforms present in the hardware
+map, so this flashes and validates only `nucleo_h755zi_q/stm32h755xx/m7`
+over serial; it does not also run the `native_sim`/`qemu_cortex_m3`
+configurations in the same invocation. Use the two commands above together
+to cover all three targets. Consult Twister's generated results instead of a
+README check total, because the total changes whenever suites or cases are
+added.
+
 ## Record the stage inputs
 
 Record the OSAL revision, harness revision and any uncommitted patch,
