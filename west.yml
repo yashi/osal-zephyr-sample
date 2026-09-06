@@ -14,5 +14,5 @@ manifest:
 
     - name: osal
       url: https://github.com/yashi/osal-zephyr
-      revision: add-zephyr-support
+      revision: a56a485fe7376dfe82631f43770cad1ebbee944f
       path: modules/lib/osal
