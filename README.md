@@ -27,7 +27,9 @@ the selected OSAL module; its source is not copied into the harness.
 `init` requires the initialization and synchronous console providers. Its
 ten checks cover initialization and shutdown signaling, not public task or
 semaphore lifecycle, clocks, timers, or object teardown. Focused provider and
-concurrency tests live in the OSAL checkout at `src/tests/zephyr-init`.
+concurrency tests live in this repository at `tests/zephyr-init`: they are a
+Zephyr-only ztest application, so they belong in the harness rather than in
+`osal-zephyr`'s upstream-shared test trees.
 
 ## Build a stage
 
