@@ -102,8 +102,9 @@ static void condvar_after(void *fixture)
         workers_started = false;
     }
 
-    /* A failed assertion can leave the test thread owning the mutex. */
-    (void)OS_CondVarCreate_Impl(&condvar_token, 0);
+    /* A failed assertion may leave application ownership or a waiter
+     * reservation behind. Do not hide that failure by resetting live
+     * native storage; successful cases delete their own object. */
 }
 
 ZTEST(osal_zephyr_condvar, test_signal_and_broadcast)
