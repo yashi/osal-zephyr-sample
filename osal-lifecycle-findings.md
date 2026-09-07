@@ -7,8 +7,9 @@ shared-layer fixes and portable tests through the upstream process.
 
 ## The admission gap
 
-Shared OSAL validates binary-semaphore Give/Take/Flush/TimedWait and mutex
-Give/Take using `OS_LOCK_MODE_NONE`. The resulting token contains a full
+Shared OSAL validates binary-semaphore Give/Take/Flush/TimedWait, mutex
+Give/Take, and counting-semaphore Give/Take/TimedWait using
+`OS_LOCK_MODE_NONE`. The resulting token contains a full
 object ID and a physical table index, but does not retain the object's
 lifetime. A thread can pause after validation, another thread can delete and
 recreate the slot, and the original operation can resume against replacement
@@ -92,6 +93,9 @@ freshly flashed `nucleo_h755zi_q/stm32h755xx/m7` with serial validation:
 | Condition-variable lifecycle suite | 14 | Passed |
 | Existing condition-variable focused suite | 2 | Passed |
 | Existing condition-variable stage | 29 | Passed |
+| Counting-semaphore public suite | 9 grouped cases | Passed |
+| Counting-semaphore stage | 38 | Passed for initial and guarded providers |
+| Reset-only counting-semaphore control | 1 | Rejected the unsafe candidate |
 
 All builds selected the development OSAL module exactly once. The lifecycle
 fixtures use real public OSAL APIs and native kernel operations, with wrappers
@@ -171,3 +175,61 @@ after each test, which could reset storage despite remaining ownership.
 
 This increment received independent source and evidence review. It remains
 limited to distinct full IDs and normally completing untimed operations.
+
+
+## Counting-semaphore follow-up
+
+Counting semaphores use a native Zephyr `k_sem` and a permanent per-slot
+mutex. The shared Give/Take/TimedWait wrappers supply an unpinned token but
+do not access mutable count metadata before provider entry. Validate the
+full ID under the permanent mutex before touching the native semaphore.
+
+A Take reserves an atomic admitted-user count before releasing that mutex
+and entering its native wait. Its final object access releases the reservation
+after the native operation returns. Delete tries the mutex without waiting
+and returns `OS_SEM_FAILURE` if the mutex is busy or admitted users remain;
+the shared finalizer restores the original public ID. No reset is used to
+cancel waiters. Once every admitted operation finishes, deletion and reuse
+can proceed. This differs from the binary-semaphore guard, which can invalidate
+sleeping waiters and wake them to reject their old ID.
+
+Give holds state through the full-ID check, overflow check, and native Give.
+The maximum is `INT32_MAX`, keeping GetInfo's signed count representable.
+Larger initial values return `OS_INVALID_SEM_VALUE`; Give at the maximum
+returns `OS_SEM_FAILURE` instead of silently saturating. With givers serialized,
+concurrent takers only decrease the count. The reviewed evidence is for UP
+targets and does not establish SMP acceptance or ISR-safe public operations.
+
+TimedWait uses one deadline for state admission and native waiting. The final
+atomic release requires no cleanup mutex that could extend a timeout. Normal
+scheduling and tick rounding still apply. Positive finite waits without a
+system clock are unsupported; with 32-bit native timeouts, requests above a
+conservative `INT32_MAX` tick conversion are unsupported. Both cases return
+`OS_ERR_NOT_IMPLEMENTED`. The required targets use clocks and 64-bit timeouts.
+
+The permanent mutex is initialized only once. Native semaphore initialization
+on reuse occurs only after quiescence. When Zephyr object cores are enabled,
+Delete uses the public unlink API before another Create registers the same
+storage. Reinitializing a still-registered native object would damage the
+registry even without active waiters; this is a separate native lifecycle
+obligation discovered during implementation review.
+
+A local reset-only negative control reproduced the admission gap on all three
+targets: an old call passed its deleted-state check, paused before native Take,
+then consumed a replacement token supplied after reset. The experiment passes
+by detecting the rejected candidate's failure, not by establishing provider
+safety. Initial and guarded provider stage snapshots separately passed 38
+checks per target. The [public counting-semaphore suite](tests/zephyr-countsem/README.md)
+then passed nine grouped cases per target on native_sim, QEMU Cortex-M3 and
+freshly flashed Nucleo H755 M7. It forces stale Give/Take/TimedWait calls at
+both admission boundaries; holds reservations before native entry and after
+success/timeout; overlaps real givers and native Take/Give; verifies partial
+timeout budgets and wide finite conversion; and checks registry membership
+with two live neighboring objects through repeated reuse. Eight deterministic
+three-waiter rounds verify exact permit accounting. These are controlled
+interleavings, not randomized stress with varying priorities or timer load.
+
+Forced native termination while admitted would strand the reservation;
+termination while holding state could strand the mutex. Task retirement,
+full ID wrap, SMP and nonquiescent teardown remain deferred. The shared-layer
+fix stays scheduled after the Zephyr port merges.
