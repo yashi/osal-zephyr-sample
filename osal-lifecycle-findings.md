@@ -89,9 +89,12 @@ freshly flashed `nucleo_h755zi_q/stm32h755xx/m7` with serial validation:
 | Mutex native protection | 10 | Passed |
 | Mutex shared-owner diagnostic | 1 | Confirmed the remaining defect |
 | Existing mutex stage | 17 | Passed |
+| Condition-variable lifecycle suite | 14 | Passed |
+| Existing condition-variable focused suite | 2 | Passed |
+| Existing condition-variable stage | 29 | Passed |
 
-All builds selected the development OSAL module exactly once. The fixtures
-use real public OSAL APIs and native kernel operations, with linker wrappers
+All builds selected the development OSAL module exactly once. The lifecycle
+fixtures use real public OSAL APIs and native kernel operations, with wrappers
 providing deterministic scheduling barriers. Provider return values and
 shared admission modes are not mocked. The mutex handoff test requires UP
 scheduling and a worker with higher priority than the controller.
@@ -112,16 +115,59 @@ original defects and must not be counted as safety regressions.
   Public task retirement and cancellation require an ownership-aware design.
 - A stale mutex Take can wait behind a replacement owner before rejecting
   its ID. No bounded completion guarantee is established for that case.
-- Tests use one slot and one worker at a time, with SMP, shell and networking
-  disabled. They do not establish multiwaiter/deleter stress coverage or
-  priority-inversion performance.
+- Lifecycle fixtures use one slot and one worker at a time, with SMP, shell
+  and networking disabled. The existing condition-variable suites separately
+  exercise three waiters. These do not establish multiwaiter/deleter stress
+  coverage or priority-inversion performance.
 - The full `OS_API_Teardown()` probe cannot yet link because unrelated
   providers remain unimplemented. Manual cleanup and quiescent re-init do
   not establish active-user recovery or full teardown correctness.
-- Condition variables retain application ownership across Lock/Wait/Unlock
-  and require their own lifecycle analysis and tests.
+- The untimed condition-variable follow-up below retains ownership through
+  Wait; timed waits and forced cancellation remain separate work.
 
 After the Zephyr port merges, agree on the shared deletion/cancellation
 contract, implement admission and lifetime protection before shared state
 access, and add portable tests for all supported ports. Until then, native
 provider protection must not be presented as complete shared-object safety.
+
+
+## Condition-variable follow-up
+
+The untimed condition-variable guard preserves the native application mutex,
+condition variable and a separate internal state mutex across logical reuse.
+The extra state mutex lets Signal/Broadcast validate the full ID through native
+notification without waiting for another thread's application ownership.
+
+Delete uses nonblocking probes for both mutexes, then rejects any outstanding
+application depth or wait reservation with `OS_ERROR`. This preserves the
+original object on deletion failure. A successful Lock retains native ownership;
+Wait converts its single application acquisition into a reservation before
+atomically releasing the native mutex. The reservation remains until native
+reacquisition finishes and application depth is restored. Deletion is therefore
+rejected even when all waiters are asleep and the application mutex is free.
+
+Wait without ownership or with recursive depth other than one is rejected
+without losing existing acquisitions. Zephyr's native Wait releases one level
+only; accepting a recursively held mutex would leave the outer level held and
+prevent ordinary predicate handoff. TimedWait continues to return
+`OS_ERR_NOT_IMPLEMENTED` without changing application ownership.
+
+Unlike the mutex Give path, shared condvar operations do not mutate per-slot
+owner metadata before provider entry. The Zephyr guard can therefore cover
+these untimed operations for distinct full IDs and normally completing callers
+without a shared-source change. Native thread termination during a reserved
+wait would strand that reservation; task retirement must release it as part
+of the deferred E5 design. This guard does not claim cancellation safety.
+
+The [condition-variable lifecycle suite](tests/zephyr-condvar-lifecycle/README.md)
+passed fourteen cases on native_sim, QEMU Cortex-M3 and a freshly flashed
+Nucleo H755 M7. Its native-notification counters confirm that stale calls do
+not reach Signal/Broadcast after reuse. It isolates both waiter reservation
+and state-lock protection, including the interval before native reacquisition
+with no application owner. The existing two focused cases and twenty-nine
+stage checks also passed on each target, including three-worker signal and
+broadcast behavior. The old focused fixture no longer calls Create as recovery
+after each test, which could reset storage despite remaining ownership.
+
+This increment received independent source and evidence review. It remains
+limited to distinct full IDs and normally completing untimed operations.
