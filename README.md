@@ -120,6 +120,11 @@ automatically, so adding a new suite (a `tests.yaml`/`testcase.yaml`,
 `CMakeLists.txt`, and `prj.conf` alongside its sources, following the
 `tests/zephyr-init` layout) needs no changes anywhere else to be picked up.
 
+The current focused suites cover initialization, clocks, condition variables,
+binary-semaphore admission and reuse, mutex lifecycle boundaries, and
+counting-semaphore lifecycle and concurrency. Detailed scope and limitations
+for the lifecycle suites are recorded in the README beside each suite.
+
 Each suite's `tests.yaml` lists the three development targets under both
 `platform_allow` and `integration_platforms`, so the board list lives in the
 test file, not on the command line.

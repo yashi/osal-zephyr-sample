@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+
+tests:
+  osal.zephyr.countsem:
+    tags:
+      - osal
+      - synchronization
+      - lifecycle
+    harness: ztest
+    timeout: 90
+    platform_allow:
+      - native_sim
+      - qemu_cortex_m3
+      - nucleo_h755zi_q/stm32h755xx/m7
+    integration_platforms:
+      - native_sim
+      - qemu_cortex_m3
+      - nucleo_h755zi_q/stm32h755xx/m7
