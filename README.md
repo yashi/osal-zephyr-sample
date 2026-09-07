@@ -13,6 +13,7 @@ that application's stated scope.
 | `apps/binsem` | Exercise binary-semaphore create, give, take, timed-wait, flush, information, delete, and slot-reuse provider behavior |
 | `apps/clock` | Exercise native monotonic and settable local clocks, including forward and backward local-time changes |
 | `apps/condvar` | Exercise condition-variable locking, waiting, signaling, and broadcasting with three Zephyr threads |
+| `apps/countsem` | Exercise counting-semaphore values, limits, give/take, timed-wait, information, delete, and slot reuse |
 | `apps/init` | Call real OSAL initialization, check tick values and console identity/draining, repeat initialization, and request shutdown before entering idle |
 | `apps/mutex` | Exercise recursive mutex take/give behavior, independent objects, information, delete, and slot reuse |
 
