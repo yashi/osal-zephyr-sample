@@ -16,6 +16,7 @@ that application's stated scope.
 | `apps/countsem` | Exercise counting-semaphore values, limits, give/take, timed-wait, information, delete, and slot reuse |
 | `apps/init` | Call real OSAL initialization, check tick values and console identity/draining, repeat initialization, and request shutdown before entering idle |
 | `apps/mutex` | Exercise recursive mutex take/give behavior, independent objects, information, delete, and slot reuse |
+| `apps/tasks` | Exercise public task creation, identity, delay, properties, priority changes, entry return, and deletion of a resource-free task |
 
 `basic` does not call `OS_API_Init()` or `OS_Application_Startup()`. It makes
 initial build integration independently checkable without depending on
@@ -33,6 +34,15 @@ semaphore lifecycle, clocks, timers, or object teardown. Focused provider and
 concurrency tests live in this repository at `tests/zephyr-init`: they are a
 Zephyr-only ztest application, so they belong in the harness rather than in
 `osal-zephyr`'s upstream-shared test trees.
+
+`tasks` uses the public OSAL API and dynamically allocated stacks. It checks
+normal task lifecycle and deletion of a worker that owns no resource. The
+Zephyr backend rejects deletion while a task is in a protected internal
+operation, including a blocked semaphore or condition-variable wait. Such a
+failure preserves the task ID and lets the task continue. This stage does not
+establish cancellation of blocked OSAL operations or cleanup of application
+resources. Release owned mutexes and other resources before task termination.
+Caller-provided stack buffers are not supported by this initial backend.
 
 ## Build a stage
 
