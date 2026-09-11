@@ -35,14 +35,26 @@ concurrency tests live in this repository at `tests/zephyr-init`: they are a
 Zephyr-only ztest application, so they belong in the harness rather than in
 `osal-zephyr`'s upstream-shared test trees.
 
-`tasks` uses the public OSAL API and dynamically allocated stacks. It checks
-normal task lifecycle and deletion of a worker that owns no resource. The
-Zephyr backend rejects deletion while a task is in a protected internal
+`tasks` uses the public OSAL API with static thread stacks and no system heap.
+It checks normal task lifecycle and deletion of a worker that owns no
+resource. The Zephyr backend rejects deletion while a task is in a protected
+internal
 operation, including a blocked semaphore or condition-variable wait. Such a
 failure preserves the task ID and lets the task continue. This stage does not
 establish cancellation of blocked OSAL operations or cleanup of application
 resources. Release owned mutexes and other resources before task termination.
-Caller-provided stack buffers are not supported by this initial backend.
+Supply static-duration stacks declared with `K_KERNEL_STACK_DEFINE`, passing
+the stack symbol and `K_KERNEL_STACK_SIZEOF(symbol)` to `OS_TaskCreate()`.
+Keep their storage alive for the application lifetime. OSAL reserves supplied
+stack ranges until the native thread has been joined and rejects overlapping
+use; disappearance of a public task ID alone does not establish reclamation.
+
+Native thread objects are stored in OSAL's static task table. NULL stack
+pointers are rejected by default. Applications can explicitly enable
+`CONFIG_CFS_OSAL_DYNAMIC_TASK_STACKS=y` and configure `HEAP_MEM_POOL_SIZE`
+to allocate stacks for NULL pointers. OSAL never frees supplied stacks.
+Native thread pointers may repeat across task generations; system-data lookup
+identifies the current native task, not a historical generation.
 
 ## Build a stage
 

@@ -16,6 +16,8 @@ static int32 delay_status;
 static bool custom_data_preserved;
 static bool reached_after_wait;
 static int custom_data;
+K_KERNEL_STACK_DEFINE(graceful_stack, 2048);
+K_KERNEL_STACK_DEFINE(delete_stack, 2048);
 
 static void worker(void)
 {
@@ -57,7 +59,7 @@ int main(void)
         return harness_finish(&h);
     }
     harness_check(&h, !OS_ObjectIdDefined(OS_TaskGetId()), "external-identity");
-    status = OS_TaskCreate(&id, "graceful", worker, NULL, 2048, 128, 0);
+    status = OS_TaskCreate(&id, "graceful", worker, graceful_stack, K_KERNEL_STACK_SIZEOF(graceful_stack), 128, 0);
     harness_check(&h, status == OS_SUCCESS, "create-graceful");
     if (status != OS_SUCCESS) {
         return harness_finish(&h);
@@ -72,7 +74,7 @@ int main(void)
     harness_check(&h, delay_status == OS_SUCCESS, "task-delay");
     status = OS_TaskGetInfo(id, &prop);
     harness_check(&h, status == OS_SUCCESS && strcmp(prop.name, "graceful") == 0 &&
-                  prop.stack_size == 2048 && prop.priority == 128, "task-info");
+                  prop.stack_size == K_KERNEL_STACK_SIZEOF(graceful_stack) && prop.priority == 128, "task-info");
     status = OS_TaskGetIdByName(&found, "graceful");
     harness_check(&h, status == OS_SUCCESS && OS_ObjectIdEqual(found, id), "name-lookup");
     harness_check(&h, OS_TaskSetPriority(id, 200) == OS_SUCCESS, "set-priority");
@@ -87,7 +89,7 @@ int main(void)
     harness_check(&h, OS_TaskGetInfo(id, &prop) == OS_ERR_INVALID_ID, "retired-id");
 
     reached_after_wait = false;
-    status = OS_TaskCreate(&id, "delete", worker, NULL, 2048, 128, 0);
+    status = OS_TaskCreate(&id, "delete", worker, delete_stack, K_KERNEL_STACK_SIZEOF(delete_stack), 128, 0);
     harness_check(&h, status == OS_SUCCESS, "create-delete");
     if (status != OS_SUCCESS) {
         return harness_finish(&h);
