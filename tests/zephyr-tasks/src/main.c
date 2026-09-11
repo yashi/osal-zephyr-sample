@@ -16,6 +16,7 @@
 
 #define WATCHDOG_MS 3000
 #define STACK_SIZE 2048
+#define OVERLAP_STACK_SIZE (STACK_SIZE / 2)
 #define REUSE_ROUNDS 8
 
 BUILD_ASSERT(!IS_ENABLED(CONFIG_SMP), "native wait observations require UP scheduling");
@@ -33,6 +34,23 @@ struct task_probe
     int32 status;
 };
 
+K_KERNEL_STACK_DEFINE(task_stack_0, STACK_SIZE);
+K_KERNEL_STACK_DEFINE(task_stack_1, STACK_SIZE);
+K_KERNEL_STACK_DEFINE(task_stack_2, STACK_SIZE);
+K_KERNEL_STACK_DEFINE(task_stack_3, STACK_SIZE);
+K_KERNEL_STACK_DEFINE(controller_stack, STACK_SIZE);
+
+static k_thread_stack_t *const task_stacks[] = {
+    task_stack_0,
+    task_stack_1,
+    task_stack_2,
+    task_stack_3,
+};
+
+BUILD_ASSERT(K_KERNEL_STACK_SIZEOF(task_stack_0) == K_KERNEL_STACK_SIZEOF(task_stack_1));
+BUILD_ASSERT(K_KERNEL_STACK_SIZEOF(task_stack_0) == K_KERNEL_STACK_SIZEOF(task_stack_2));
+BUILD_ASSERT(K_KERNEL_STACK_SIZEOF(task_stack_0) == K_KERNEL_STACK_SIZEOF(task_stack_3));
+
 static struct task_probe identity_probe;
 static struct task_probe high_probe;
 static struct task_probe middle_probe;
@@ -41,21 +59,51 @@ static struct task_probe exit_probe;
 static struct task_probe reuse_probe;
 static struct task_probe countsem_probe;
 static struct task_probe table_lock_probe;
+static struct task_probe reservation_probe;
+static struct task_probe dynamic_probe;
 static struct k_sem observed_native_wait;
 static struct k_sem shutdown_fallback_entered;
 static struct k_sem reuse_wait;
 static struct k_sem table_lock_delete_wait;
+static struct k_sem exit_impl_entered;
+static struct k_sem exit_impl_release;
+static struct k_sem native_create_entered;
+static struct k_sem native_create_release;
+static struct k_sem observed_join;
+static struct k_sem controller_start;
+static struct k_sem controller_done;
 static atomic_ptr_t observed_sem;
+static atomic_ptr_t observed_join_thread;
+static atomic_ptr_t native_create_controller;
+static atomic_ptr_t exit_gate_thread;
 static atomic_t fail_next_stack_allocation;
 static atomic_t observe_shutdown_fallback;
 static atomic_t successful_stack_frees;
+static atomic_t unexpected_supplied_stack_frees;
+static atomic_t observe_heap_calls;
+static atomic_t heap_alloc_calls;
+static atomic_t heap_free_calls;
+static atomic_t gate_exit_impl;
+static atomic_t gate_native_create;
 static atomic_t delete_hook_calls;
 static uintptr_t managed_sentinel;
 static osal_id_t countsem_id = OS_OBJECT_ID_UNDEFINED;
+static struct k_thread controller_thread;
+static osal_id_t controller_task_id = OS_OBJECT_ID_UNDEFINED;
+static int32 controller_status = OS_ERROR;
 
 int __real_z_impl_k_sem_take(struct k_sem *sem, k_timeout_t timeout);
+#ifdef CONFIG_CFS_OSAL_DYNAMIC_TASK_STACKS
 k_thread_stack_t *__real_z_impl_k_thread_stack_alloc(size_t size, int flags);
 int __real_z_impl_k_thread_stack_free(k_thread_stack_t *stack);
+#endif
+k_tid_t __real_z_impl_k_thread_create(struct k_thread *new_thread, k_thread_stack_t *stack, size_t stack_size,
+                                      k_thread_entry_t entry, void *p1, void *p2, void *p3, int prio,
+                                      uint32_t options, k_timeout_t delay);
+int __real_z_impl_k_thread_join(struct k_thread *thread, k_timeout_t timeout);
+void __real_OS_TaskExit_Impl(void);
+void *__real_k_malloc(size_t size);
+void __real_k_free(void *ptr);
 int32 __real_OS_ObjectIdGetById(OS_lock_mode_t lock_mode, osal_objtype_t obj_type, osal_id_t id,
                                 OS_object_token_t *token);
 
@@ -80,6 +128,7 @@ int __wrap_z_impl_k_sem_take(struct k_sem *sem, k_timeout_t timeout)
     return __real_z_impl_k_sem_take(sem, timeout);
 }
 
+#ifdef CONFIG_CFS_OSAL_DYNAMIC_TASK_STACKS
 k_thread_stack_t *__wrap_z_impl_k_thread_stack_alloc(size_t size, int flags)
 {
     if (atomic_cas(&fail_next_stack_allocation, 1, 0))
@@ -96,8 +145,69 @@ int __wrap_z_impl_k_thread_stack_free(k_thread_stack_t *stack)
     if (status == 0)
     {
         atomic_inc(&successful_stack_frees);
+        for (size_t i = 0; i < ARRAY_SIZE(task_stacks); ++i)
+        {
+            if (stack == task_stacks[i])
+            {
+                atomic_inc(&unexpected_supplied_stack_frees);
+            }
+        }
     }
     return status;
+}
+#endif
+
+k_tid_t __wrap_z_impl_k_thread_create(struct k_thread *new_thread, k_thread_stack_t *stack, size_t stack_size,
+                                      k_thread_entry_t entry, void *p1, void *p2, void *p3, int prio,
+                                      uint32_t options, k_timeout_t delay)
+{
+    if (atomic_get(&gate_native_create) != 0 && k_current_get() == atomic_ptr_get(&native_create_controller) &&
+        atomic_cas(&gate_native_create, 1, 0))
+    {
+        k_sem_give(&native_create_entered);
+        k_sem_take(&native_create_release, K_FOREVER);
+    }
+    return __real_z_impl_k_thread_create(new_thread, stack, stack_size, entry, p1, p2, p3, prio, options, delay);
+}
+
+int __wrap_z_impl_k_thread_join(struct k_thread *thread, k_timeout_t timeout)
+{
+    int status = __real_z_impl_k_thread_join(thread, timeout);
+
+    if (status == 0 && thread == atomic_ptr_get(&observed_join_thread))
+    {
+        atomic_ptr_set(&observed_join_thread, NULL);
+        k_sem_give(&observed_join);
+    }
+    return status;
+}
+
+void __wrap_OS_TaskExit_Impl(void)
+{
+    if (k_current_get() == atomic_ptr_get(&exit_gate_thread) && atomic_cas(&gate_exit_impl, 1, 0))
+    {
+        k_sem_give(&exit_impl_entered);
+        k_sem_take(&exit_impl_release, K_FOREVER);
+    }
+    __real_OS_TaskExit_Impl();
+}
+
+void *__wrap_k_malloc(size_t size)
+{
+    if (atomic_get(&observe_heap_calls) != 0)
+    {
+        atomic_inc(&heap_alloc_calls);
+    }
+    return __real_k_malloc(size);
+}
+
+void __wrap_k_free(void *ptr)
+{
+    if (atomic_get(&observe_heap_calls) != 0)
+    {
+        atomic_inc(&heap_free_calls);
+    }
+    __real_k_free(ptr);
 }
 
 static bool same_id(osal_id_t left, osal_id_t right)
@@ -153,6 +263,10 @@ static void natural_return_entry(void)
 {
     capture_probe(&exit_probe);
     k_sem_give(&exit_probe.started);
+    if (atomic_get(&gate_exit_impl) != 0)
+    {
+        atomic_ptr_set(&exit_gate_thread, k_current_get());
+    }
 }
 
 static void explicit_exit_entry(void)
@@ -192,6 +306,23 @@ static void table_lock_entry(void)
     k_sem_take(&table_lock_delete_wait, K_FOREVER);
 }
 
+static void reservation_entry(void) { capture_and_wait(&reservation_probe); }
+
+static void dynamic_entry(void) { capture_and_wait(&dynamic_probe); }
+
+static void create_controller_entry(void *arg1, void *arg2, void *arg3)
+{
+    ARG_UNUSED(arg1);
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+
+    k_sem_take(&controller_start, K_FOREVER);
+    controller_status = OS_TaskCreate(&controller_task_id, "reserved-create", reservation_entry,
+                                      OSAL_STACKPTR_C(task_stack_2), K_KERNEL_STACK_SIZEOF(task_stack_2),
+                                      OSAL_PRIORITY_C(0), 0);
+    k_sem_give(&controller_done);
+}
+
 static void wait_started(struct task_probe *probe)
 {
     zassert_equal(k_sem_take(&probe->started, K_MSEC(WATCHDOG_MS)), 0, "managed task did not signal startup");
@@ -222,13 +353,33 @@ static void assert_name_gone(const char *name)
     zassert_equal(status, OS_ERR_NAME_NOT_FOUND, "%s remained registered: %d", name, (int)status);
 }
 
-static osal_id_t create_task(const char *name, osal_task_entry entry, osal_priority_t priority)
+static void assert_static_path_did_not_allocate(void)
+{
+    if (!IS_ENABLED(CONFIG_CFS_OSAL_DYNAMIC_TASK_STACKS))
+    {
+        zassert_equal(atomic_get(&heap_alloc_calls), 0, "static task path called k_malloc");
+        zassert_equal(atomic_get(&heap_free_calls), 0, "static task path called k_free");
+    }
+}
+
+static osal_id_t create_task(const char *name, osal_task_entry entry, osal_priority_t priority, size_t stack_index)
 {
     osal_id_t id;
-    int32 status;
+    int32 status = OS_ERROR;
+    int64_t deadline = k_uptime_get() + WATCHDOG_MS;
 
-    status = OS_TaskCreate(&id, name, entry, OSAL_TASK_STACK_ALLOCATE, STACK_SIZE, priority, 0);
+    zassert_true(stack_index < ARRAY_SIZE(task_stacks));
+    do
+    {
+        status = OS_TaskCreate(&id, name, entry, OSAL_STACKPTR_C(task_stacks[stack_index]),
+                               K_KERNEL_STACK_SIZEOF(task_stack_0), priority, 0);
+        if (status == OS_ERROR)
+        {
+            k_sleep(K_MSEC(1));
+        }
+    } while (status == OS_ERROR && k_uptime_get() < deadline);
     zassert_equal(status, OS_SUCCESS, "Create %s returned %d", name, (int)status);
+    assert_static_path_did_not_allocate();
     return id;
 }
 
@@ -246,7 +397,7 @@ ZTEST(osal_zephyr_tasks, test_public_identity_info_name_and_system_data)
     zassert_false(OS_ObjectIdDefined(OS_TaskGetId()), "external ztest thread acquired an OSAL ID");
     zassert_equal(k_thread_custom_data_get(), &external_sentinel, "external GetId changed custom data");
 
-    id = create_task("identity", identity_entry, OSAL_PRIORITY_C(0));
+    id = create_task("identity", identity_entry, OSAL_PRIORITY_C(0), 0);
     wait_started(&identity_probe);
 
     zassert_true(same_id(identity_probe.id, id), "managed GetId returned another ID");
@@ -257,7 +408,7 @@ ZTEST(osal_zephyr_tasks, test_public_identity_info_name_and_system_data)
     zassert_equal(OS_TaskGetInfo(id, &info), OS_SUCCESS);
     zassert_mem_equal(info.name, "identity", sizeof("identity"));
     zassert_false(OS_ObjectIdDefined(info.creator));
-    zassert_equal(info.stack_size, STACK_SIZE);
+    zassert_equal(info.stack_size, K_KERNEL_STACK_SIZEOF(task_stack_0));
     zassert_equal(info.priority, OSAL_PRIORITY_C(0));
     zassert_equal(OS_TaskFindIdBySystemData(&found, &identity_probe.tid, sizeof(identity_probe.tid)), OS_SUCCESS);
     zassert_true(same_id(found, id));
@@ -279,9 +430,9 @@ ZTEST(osal_zephyr_tasks, test_priority_endpoints_ordering_and_updates)
     reset_probe(&high_probe);
     reset_probe(&middle_probe);
     reset_probe(&low_probe);
-    high_id = create_task("priority-high", high_entry, OSAL_PRIORITY_C(0));
-    middle_id = create_task("priority-middle", middle_entry, OSAL_PRIORITY_C(128));
-    low_id = create_task("priority-low", low_entry, OSAL_PRIORITY_C(255));
+    high_id = create_task("priority-high", high_entry, OSAL_PRIORITY_C(0), 0);
+    middle_id = create_task("priority-middle", middle_entry, OSAL_PRIORITY_C(128), 1);
+    low_id = create_task("priority-low", low_entry, OSAL_PRIORITY_C(255), 2);
     wait_started(&high_probe);
     wait_started(&middle_probe);
     wait_started(&low_probe);
@@ -315,14 +466,14 @@ ZTEST(osal_zephyr_tasks, test_entry_return_and_explicit_exit_cleanup)
     osal_id_t id;
 
     reset_probe(&exit_probe);
-    id = create_task("natural-return", natural_return_entry, OSAL_PRIORITY_C(0));
+    id = create_task("natural-return", natural_return_entry, OSAL_PRIORITY_C(0), 0);
     wait_started(&exit_probe);
     zassert_true(same_id(exit_probe.id, id));
     assert_name_gone("natural-return");
     zassert_equal(OS_TaskGetInfo(id, &(OS_task_prop_t){0}), OS_ERR_INVALID_ID);
 
     reset_probe(&exit_probe);
-    id = create_task("explicit-exit", explicit_exit_entry, OSAL_PRIORITY_C(0));
+    id = create_task("explicit-exit", explicit_exit_entry, OSAL_PRIORITY_C(0), 1);
     wait_started(&exit_probe);
     zassert_true(same_id(exit_probe.id, id));
     zassert_equal(exit_probe.status, OS_ERROR, "a managed task deleted itself through OS_TaskDelete");
@@ -344,7 +495,7 @@ ZTEST(osal_zephyr_tasks, test_external_delete_waiter_and_repeated_slot_reuse)
         k_sem_reset(&reuse_wait);
         k_sem_reset(&observed_native_wait);
         atomic_ptr_set(&observed_sem, &reuse_wait);
-        id = create_task("delete-reuse", reuse_entry, OSAL_PRIORITY_C(0));
+        id = create_task("delete-reuse", reuse_entry, OSAL_PRIORITY_C(0), 0);
         wait_native_take();
 
         zassert_equal(OS_TaskDelete(id), OS_SUCCESS);
@@ -371,7 +522,7 @@ ZTEST(osal_zephyr_tasks, test_managed_countsem_wait_rejects_delete)
     k_sem_reset(&observed_native_wait);
     zassert_equal(OS_CountSemCreate(&countsem_id, "task-wait-sem", 0, 0), OS_SUCCESS);
     atomic_ptr_set(&observed_sem, &OS_impl_count_sem_table[0].sem);
-    task_id = create_task("countsem-waiter", countsem_waiter_entry, OSAL_PRIORITY_C(0));
+    task_id = create_task("countsem-waiter", countsem_waiter_entry, OSAL_PRIORITY_C(0), 0);
     wait_native_take();
 
     zassert_equal(OS_TaskDelete(task_id), OS_ERROR);
@@ -397,7 +548,7 @@ ZTEST(osal_zephyr_tasks, test_table_lock_rejects_delete_and_defers_hook)
     k_sem_reset(&observed_native_wait);
     atomic_set(&delete_hook_calls, 0);
     atomic_ptr_set(&observed_sem, &table_lock_delete_wait);
-    task_id = create_task("table-lock", table_lock_entry, OSAL_PRIORITY_C(0));
+    task_id = create_task("table-lock", table_lock_entry, OSAL_PRIORITY_C(0), 1);
     wait_started(&table_lock_probe);
     zassert_equal(table_lock_probe.status, OS_SUCCESS, "managed task could not install its delete hook");
 
@@ -417,48 +568,216 @@ ZTEST(osal_zephyr_tasks, test_table_lock_rejects_delete_and_defers_hook)
 
 ZTEST(osal_zephyr_tasks, test_create_rejections_and_allocation_rollback)
 {
-    static uint8_t supplied_stack[STACK_SIZE];
     osal_id_t id;
+    uintptr_t bad_end_pointer = ROUND_DOWN(UINTPTR_MAX, Z_KERNEL_STACK_OBJ_ALIGN);
 
     zassert_equal(
         OS_TaskCreate(&id, "zero-stack", natural_return_entry, OSAL_TASK_STACK_ALLOCATE, 0, OSAL_PRIORITY_C(128), 0),
         OS_ERR_INVALID_SIZE);
-    zassert_equal(OS_TaskCreate(&id, "supplied-stack", natural_return_entry, supplied_stack, sizeof(supplied_stack),
+    zassert_equal(OS_TaskCreate(&id, "wrong-size", natural_return_entry, OSAL_STACKPTR_C(task_stack_0),
+                                K_KERNEL_STACK_SIZEOF(task_stack_0) - 1, OSAL_PRIORITY_C(128), 0),
+                  OS_ERR_INVALID_SIZE);
+    zassert_equal(OS_TaskCreate(&id, "size-overflow", natural_return_entry, OSAL_STACKPTR_C(task_stack_0), SIZE_MAX,
                                 OSAL_PRIORITY_C(128), 0),
-                  OS_ERR_NOT_IMPLEMENTED);
-    zassert_equal(OS_TaskCreate(&id, "unknown-flags", natural_return_entry, OSAL_TASK_STACK_ALLOCATE, STACK_SIZE,
+                  OS_ERR_INVALID_SIZE);
+    zassert_equal(OS_TaskCreate(&id, "misaligned", natural_return_entry,
+                                OSAL_STACKPTR_C((uint8_t *)task_stack_0 + 1),
+                                K_KERNEL_STACK_SIZEOF(task_stack_0), OSAL_PRIORITY_C(128), 0),
+                  OS_INVALID_POINTER);
+    zassert_equal(OS_TaskCreate(&id, "end-overflow", natural_return_entry, (osal_stackptr_t)bad_end_pointer,
+                                K_KERNEL_STACK_SIZEOF(task_stack_0), OSAL_PRIORITY_C(128), 0),
+                  OS_INVALID_POINTER);
+    zassert_equal(OS_TaskCreate(&id, "unknown-flags", natural_return_entry, OSAL_STACKPTR_C(task_stack_0),
+                                K_KERNEL_STACK_SIZEOF(task_stack_0),
                                 OSAL_PRIORITY_C(128), UINT32_C(0x80000000)),
                   OS_ERR_NOT_IMPLEMENTED);
 
+#ifdef CONFIG_CFS_OSAL_DYNAMIC_TASK_STACKS
     atomic_set(&fail_next_stack_allocation, 1);
     zassert_equal(OS_TaskCreate(&id, "alloc-failure", natural_return_entry, OSAL_TASK_STACK_ALLOCATE, STACK_SIZE,
                                 OSAL_PRIORITY_C(128), 0),
                   OS_ERROR);
+#else
+    zassert_equal(OS_TaskCreate(&id, "alloc-failure", natural_return_entry, OSAL_TASK_STACK_ALLOCATE, STACK_SIZE,
+                                OSAL_PRIORITY_C(128), 0),
+                  OS_ERR_NOT_IMPLEMENTED);
+#endif
     zassert_equal(OS_TaskGetIdByName(&id, "alloc-failure"), OS_ERR_NAME_NOT_FOUND);
 
     reset_probe(&exit_probe);
-    id = create_task("alloc-failure", natural_return_entry, OSAL_PRIORITY_C(0));
+    id = create_task("alloc-failure", natural_return_entry, OSAL_PRIORITY_C(0), 2);
     wait_started(&exit_probe);
     assert_name_gone("alloc-failure");
+    assert_static_path_did_not_allocate();
+}
+
+ZTEST(osal_zephyr_tasks, test_retired_stack_claim_survives_public_id)
+{
+    k_thread_stack_t *overlap_stack;
+    k_thread_stack_t *guard_tail_stack;
+    size_t overlap_size = K_KERNEL_STACK_LEN(OVERLAP_STACK_SIZE) - K_KERNEL_STACK_RESERVED;
+    osal_id_t id;
+    k_tid_t retiring_thread;
+
+    reset_probe(&exit_probe);
+    k_sem_reset(&exit_impl_entered);
+    k_sem_reset(&exit_impl_release);
+    k_sem_reset(&observed_join);
+    atomic_ptr_set(&exit_gate_thread, NULL);
+    atomic_set(&gate_exit_impl, 1);
+    id = create_task("retiring-stack", natural_return_entry, OSAL_PRIORITY_C(0), 3);
+    wait_started(&exit_probe);
+    retiring_thread = exit_probe.tid;
+    zassert_equal(k_sem_take(&exit_impl_entered, K_MSEC(WATCHDOG_MS)), 0,
+                  "task did not reach native exit after public finalization");
+    assert_name_gone("retiring-stack");
+
+    overlap_stack = (k_thread_stack_t *)((uintptr_t)task_stack_3 + K_KERNEL_STACK_LEN(STACK_SIZE) -
+                                         K_KERNEL_STACK_LEN(OVERLAP_STACK_SIZE));
+    zassert_equal(OS_TaskCreate(&id, "same-retired", natural_return_entry, OSAL_STACKPTR_C(task_stack_3),
+                                K_KERNEL_STACK_SIZEOF(task_stack_3), OSAL_PRIORITY_C(0), 0),
+                  OS_ERROR);
+    zassert_equal(OS_TaskCreate(&id, "overlap-retired", natural_return_entry, OSAL_STACKPTR_C(overlap_stack),
+                                overlap_size, OSAL_PRIORITY_C(0), 0),
+                  OS_ERROR);
+    if (K_KERNEL_STACK_RESERVED > 0)
+    {
+        guard_tail_stack = (k_thread_stack_t *)((uintptr_t)task_stack_3 +
+                                                K_KERNEL_STACK_SIZEOF(task_stack_3));
+        zassert_equal(OS_TaskCreate(&id, "guard-tail-retired", natural_return_entry,
+                                    OSAL_STACKPTR_C(guard_tail_stack), overlap_size, OSAL_PRIORITY_C(0), 0),
+                      OS_ERROR);
+    }
+
+    atomic_ptr_set(&observed_join_thread, retiring_thread);
+    k_sem_give(&exit_impl_release);
+    zassert_equal(k_sem_take(&observed_join, K_MSEC(WATCHDOG_MS)), 0,
+                  "retired task was not joined after native exit");
+
+    reset_probe(&reuse_probe);
+    k_sem_reset(&reuse_wait);
+    id = create_task("joined-stack-reuse", reuse_entry, OSAL_PRIORITY_C(0), 3);
+    zassert_equal(OS_TaskDelete(id), OS_SUCCESS);
+    assert_name_gone("joined-stack-reuse");
+    assert_static_path_did_not_allocate();
+}
+
+ZTEST(osal_zephyr_tasks, test_stack_claim_precedes_native_thread_create)
+{
+    k_thread_stack_t *overlap_stack;
+    k_thread_stack_t *guard_tail_stack;
+    size_t overlap_size = K_KERNEL_STACK_LEN(OVERLAP_STACK_SIZE) - K_KERNEL_STACK_RESERVED;
+    k_tid_t controller_tid;
+    osal_id_t id;
+
+    reset_probe(&reservation_probe);
+    k_sem_reset(&controller_start);
+    k_sem_reset(&controller_done);
+    k_sem_reset(&native_create_entered);
+    k_sem_reset(&native_create_release);
+    controller_status = OS_ERROR;
+    controller_task_id = OS_OBJECT_ID_UNDEFINED;
+    atomic_set(&gate_native_create, 0);
+    controller_tid = k_thread_create(&controller_thread, controller_stack, K_KERNEL_STACK_SIZEOF(controller_stack),
+                                     create_controller_entry, NULL, NULL, NULL, K_PRIO_PREEMPT(1), 0, K_NO_WAIT);
+    atomic_ptr_set(&native_create_controller, controller_tid);
+    atomic_set(&gate_native_create, 1);
+    k_sem_give(&controller_start);
+    zassert_equal(k_sem_take(&native_create_entered, K_MSEC(WATCHDOG_MS)), 0,
+                  "controller did not reach native task creation");
+
+    overlap_stack = (k_thread_stack_t *)((uintptr_t)task_stack_2 + K_KERNEL_STACK_LEN(STACK_SIZE) -
+                                         K_KERNEL_STACK_LEN(OVERLAP_STACK_SIZE));
+    zassert_equal(OS_TaskCreate(&id, "same-reserved", natural_return_entry, OSAL_STACKPTR_C(task_stack_2),
+                                K_KERNEL_STACK_SIZEOF(task_stack_2), OSAL_PRIORITY_C(0), 0),
+                  OS_ERROR);
+    zassert_equal(OS_TaskCreate(&id, "overlap-reserved", natural_return_entry, OSAL_STACKPTR_C(overlap_stack),
+                                overlap_size, OSAL_PRIORITY_C(0), 0),
+                  OS_ERROR);
+    if (K_KERNEL_STACK_RESERVED > 0)
+    {
+        guard_tail_stack = (k_thread_stack_t *)((uintptr_t)task_stack_2 +
+                                                K_KERNEL_STACK_SIZEOF(task_stack_2));
+        zassert_equal(OS_TaskCreate(&id, "guard-tail-reserved", natural_return_entry,
+                                    OSAL_STACKPTR_C(guard_tail_stack), overlap_size, OSAL_PRIORITY_C(0), 0),
+                      OS_ERROR);
+    }
+
+    k_sem_give(&native_create_release);
+    zassert_equal(k_sem_take(&controller_done, K_MSEC(WATCHDOG_MS)), 0, "controller create did not finish");
+    zassert_equal(controller_status, OS_SUCCESS);
+    wait_started(&reservation_probe);
+    zassert_equal(OS_TaskDelete(controller_task_id), OS_SUCCESS);
+    zassert_equal(k_thread_join(&controller_thread, K_MSEC(WATCHDOG_MS)), 0);
+    atomic_ptr_set(&native_create_controller, NULL);
+    assert_static_path_did_not_allocate();
+}
+
+ZTEST(osal_zephyr_tasks, test_dynamic_stack_opt_in_and_mixed_ownership)
+{
+#ifdef CONFIG_CFS_OSAL_DYNAMIC_TASK_STACKS
+    osal_id_t supplied_id;
+    osal_id_t dynamic_id;
+    int frees_before;
+    int64_t deadline;
+
+    reset_probe(&identity_probe);
+    reset_probe(&dynamic_probe);
+    reset_probe(&exit_probe);
+    atomic_set(&unexpected_supplied_stack_frees, 0);
+    frees_before = atomic_get(&successful_stack_frees);
+    zassert_equal(OS_TaskCreate(&dynamic_id, "dynamic-return", natural_return_entry, OSAL_TASK_STACK_ALLOCATE,
+                                STACK_SIZE, OSAL_PRIORITY_C(0), 0),
+                  OS_SUCCESS);
+    wait_started(&exit_probe);
+    assert_name_gone("dynamic-return");
+    deadline = k_uptime_get() + WATCHDOG_MS;
+    while (atomic_get(&successful_stack_frees) == frees_before && k_uptime_get() < deadline)
+    {
+        k_sleep(K_MSEC(1));
+    }
+    zassert_true(atomic_get(&successful_stack_frees) > frees_before,
+                 "naturally returned dynamic stack was not freed by the reaper");
+
+    supplied_id = create_task("mixed-supplied", identity_entry, OSAL_PRIORITY_C(0), 0);
+    zassert_equal(OS_TaskCreate(&dynamic_id, "mixed-dynamic", dynamic_entry, OSAL_TASK_STACK_ALLOCATE, STACK_SIZE,
+                                OSAL_PRIORITY_C(0), 0),
+                  OS_SUCCESS);
+    wait_started(&identity_probe);
+    wait_started(&dynamic_probe);
+
+    frees_before = atomic_get(&successful_stack_frees);
+    zassert_equal(OS_TaskDelete(supplied_id), OS_SUCCESS);
+    zassert_equal(atomic_get(&successful_stack_frees), frees_before, "OSAL freed a caller-supplied stack");
+    zassert_equal(OS_TaskDelete(dynamic_id), OS_SUCCESS);
+    deadline = k_uptime_get() + WATCHDOG_MS;
+    while (atomic_get(&successful_stack_frees) == frees_before && k_uptime_get() < deadline)
+    {
+        k_sleep(K_MSEC(1));
+    }
+    zassert_true(atomic_get(&successful_stack_frees) > frees_before, "dynamic stack was not freed after join");
+    zassert_equal(atomic_get(&unexpected_supplied_stack_frees), 0, "supplied stack reached native free");
+#else
+    ztest_test_skip();
+#endif
 }
 
 ZTEST(osal_zephyr_tasks, test_zzz_shutdown_exit_waits_for_reservation)
 {
     OS_object_token_t token;
     osal_id_t task_id;
-    int frees_before;
-    int64_t deadline;
 
     reset_probe(&exit_probe);
     k_sem_reset(&shutdown_fallback_entered);
+    k_sem_reset(&observed_join);
     atomic_set(&observe_shutdown_fallback, 0);
-    task_id = create_task("shutdown-return", shutdown_return_entry, OSAL_PRIORITY_C(0));
+    task_id = create_task("shutdown-return", shutdown_return_entry, OSAL_PRIORITY_C(0), 0);
     wait_started(&exit_probe);
     zassert_true(same_id(exit_probe.id, task_id));
 
     zassert_equal(OS_ObjectIdGetById(OS_LOCK_MODE_EXCLUSIVE, OS_OBJECT_TYPE_OS_TASK, task_id, &token), OS_SUCCESS);
     OS_ApplicationShutdown(true);
-    frees_before = atomic_get(&successful_stack_frees);
+    atomic_ptr_set(&observed_join_thread, exit_probe.tid);
     atomic_set(&observe_shutdown_fallback, 1);
     k_sem_give(&exit_probe.release);
     zassert_equal(k_sem_take(&shutdown_fallback_entered, K_MSEC(WATCHDOG_MS)), 0,
@@ -467,20 +786,18 @@ ZTEST(osal_zephyr_tasks, test_zzz_shutdown_exit_waits_for_reservation)
     zassert_equal(OS_ObjectIdFinalizeDelete(OS_ERROR, &token), OS_ERROR);
     atomic_set(&observe_shutdown_fallback, 0);
 
-    deadline = k_uptime_get() + WATCHDOG_MS;
-    while (atomic_get(&successful_stack_frees) == frees_before && k_uptime_get() < deadline)
-    {
-        k_sleep(K_MSEC(1));
-    }
-    zassert_true(atomic_get(&successful_stack_frees) > frees_before, "shutdown exit did not reclaim its dynamic stack");
+    zassert_equal(k_sem_take(&observed_join, K_MSEC(WATCHDOG_MS)), 0,
+                  "shutdown exit did not join its native task");
     zassert_equal(OS_ObjectIdGetById(OS_LOCK_MODE_EXCLUSIVE, OS_OBJECT_TYPE_OS_TASK, task_id, &token),
                   OS_ERR_INVALID_ID, "shutdown exit left its public task ID registered");
+    assert_static_path_did_not_allocate();
 }
 
 static void *suite_setup(void)
 {
-    struct task_probe *probes[] = {&identity_probe, &high_probe,  &middle_probe,   &low_probe,
-                                   &exit_probe,     &reuse_probe, &countsem_probe, &table_lock_probe};
+    struct task_probe *probes[] = {&identity_probe, &high_probe,        &middle_probe,   &low_probe,
+                                   &exit_probe,     &reuse_probe,       &countsem_probe, &table_lock_probe,
+                                   &reservation_probe, &dynamic_probe};
 
     for (size_t i = 0; i < ARRAY_SIZE(probes); ++i)
     {
@@ -492,7 +809,19 @@ static void *suite_setup(void)
     k_sem_init(&shutdown_fallback_entered, 0, 1);
     k_sem_init(&reuse_wait, 0, 1);
     k_sem_init(&table_lock_delete_wait, 0, 1);
+    k_sem_init(&exit_impl_entered, 0, 1);
+    k_sem_init(&exit_impl_release, 0, 1);
+    k_sem_init(&native_create_entered, 0, 1);
+    k_sem_init(&native_create_release, 0, 1);
+    k_sem_init(&observed_join, 0, 1);
+    k_sem_init(&controller_start, 0, 1);
+    k_sem_init(&controller_done, 0, 1);
+    if (!IS_ENABLED(CONFIG_CFS_OSAL_DYNAMIC_TASK_STACKS))
+    {
+        atomic_set(&observe_heap_calls, 1);
+    }
     zassert_equal(OS_API_Init(), OS_SUCCESS);
+    assert_static_path_did_not_allocate();
     return NULL;
 }
 

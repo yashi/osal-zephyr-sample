@@ -23,7 +23,17 @@ target_include_directories(app PRIVATE
 target_link_libraries(app PRIVATE osal)
 target_link_options(app PUBLIC
   LINKER:--wrap=OS_ObjectIdGetById
+  LINKER:--wrap=OS_TaskExit_Impl
+  LINKER:--wrap=k_malloc
+  LINKER:--wrap=k_free
   LINKER:--wrap=z_impl_k_sem_take
-  LINKER:--wrap=z_impl_k_thread_stack_alloc
-  LINKER:--wrap=z_impl_k_thread_stack_free
+  LINKER:--wrap=z_impl_k_thread_create
+  LINKER:--wrap=z_impl_k_thread_join
 )
+
+if(CONFIG_CFS_OSAL_DYNAMIC_TASK_STACKS)
+  target_link_options(app PUBLIC
+    LINKER:--wrap=z_impl_k_thread_stack_alloc
+    LINKER:--wrap=z_impl_k_thread_stack_free
+  )
+endif()
